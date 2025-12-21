@@ -1,0 +1,147 @@
+# Smart Grocery Tracker - DETR Configuration
+# Vision-Based Automatic Grocery Tracking System
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+model:
+  # Choose model type: "pretrained" (fine-tune HuggingFace DETR) or "scratch" (train from scratch)
+  type: "pretrained"
+  
+  # Backbone settings
+  backbone: "resnet50"              # ResNet backbone: resnet50 or resnet101
+  pretrained_backbone: true         # Use ImageNet pretrained weights for backbone
+  freeze_backbone: false            # Freeze backbone weights during training
+  
+  # Transformer settings
+  hidden_dim: 256                   # Hidden dimension of transformer
+  num_heads: 8                      # Number of attention heads
+  num_encoder_layers: 6             # Number of transformer encoder layers
+  num_decoder_layers: 6             # Number of transformer decoder layers
+  dim_feedforward: 2048             # FFN intermediate dimension
+  dropout: 0.1                      # Dropout rate in transformer
+  
+  # Object queries - each query can predict one object
+  # For dense refrigerator scenes, you might want to increase this
+  num_queries: 100                  # Number of object queries (max objects per image)
+
+# =============================================================================
+# DATA CONFIGURATION
+# =============================================================================
+data:
+  # Dataset paths (COCO format) - SmartFridgeV2 dataset
+  train_images: "SmartFridgeV2_Final.v8i.coco/train"
+  train_annotations: "SmartFridgeV2_Final.v8i.coco/train/_annotations.coco.json"
+  val_images: "SmartFridgeV2_Final.v8i.coco/valid"
+  val_annotations: "SmartFridgeV2_Final.v8i.coco/valid/_annotations.coco.json"
+  test_images: "SmartFridgeV2_Final.v8i.coco/test"
+  
+  # Image settings
+  image_size: 800                   # Max image size (shorter edge)
+  max_size: 1333                    # Max image size (longer edge)
+  
+  # DataLoader settings
+  batch_size: 2                     # Batch size (DETR requires more memory than YOLO)
+  num_workers: 4                    # Number of data loading workers
+
+# =============================================================================
+# GROCERY CLASSES (from SmartFridgeV2 dataset - 32 classes)
+# =============================================================================
+# These classes are extracted from the actual dataset annotations
+classes:
+  # Category 0 - supercategory
+  - "groceries"
+  
+  # Fruits
+  - "Apples"
+  - "Avacado"
+  - "Banana"
+  - "Bell Pepper"
+  - "Blueberries"
+  - "Bottle gourd-Calabash"
+  - "Brussels Sprouts"
+  - "Butter"
+  - "Cabbage"
+  - "Carrots"
+  - "Coconut Water"
+  - "Egg"
+  - "Egg_Raw"
+  - "Guava"
+  - "Mangos"
+  - "Milk"
+  - "None"
+  - "Pomegranate"
+  - "SaladMix"
+  - "Seafood Salad"
+  - "Spinach"
+  - "Strawberries"
+  - "Tamato"
+  - "Yogurt"
+  - "beetroot"
+  - "egg"
+  - "green chili pepper"
+  - "kiwi fruit"
+  - "mint"
+  - "oranges"
+  - "protein milk shake"
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+training:
+  # Optimization
+  lr: 1.0e-4                        # Learning rate for transformer
+  lr_backbone: 1.0e-5               # Learning rate for backbone (lower for fine-tuning)
+  weight_decay: 1.0e-4              # Weight decay (L2 regularization)
+  
+  # Learning rate schedule
+  lr_scheduler: "step"              # Scheduler type: "step" or "cosine"
+  lr_drop: 200                      # Epoch to drop LR (for step scheduler)
+  
+  # Training duration
+  epochs: 300                       # Total training epochs
+  warmup_epochs: 10                 # Warmup epochs
+  
+  # Gradient clipping (important for DETR stability)
+  clip_max_norm: 0.1                # Maximum gradient norm
+  
+  # Checkpointing
+  checkpoint_dir: "checkpoints"
+  save_every: 10                    # Save checkpoint every N epochs
+  
+  # Mixed precision training
+  use_amp: true                     # Use automatic mixed precision
+
+# =============================================================================
+# LOSS CONFIGURATION
+# =============================================================================
+loss:
+  # Loss weights for Hungarian matching cost
+  cost_class: 1.0                   # Classification cost weight
+  cost_bbox: 5.0                    # L1 bbox cost weight
+  cost_giou: 2.0                    # GIoU cost weight
+  
+  # Loss weights for final loss computation
+  loss_ce: 1.0                      # Classification loss weight
+  loss_bbox: 5.0                    # L1 bbox loss weight
+  loss_giou: 2.0                    # GIoU loss weight
+  
+  # No-object class weight (for class imbalance)
+  # Lower weight = less penalization for predicting "no object"
+  eos_coef: 0.1                     # "End of sequence" / no-object coefficient
+
+# =============================================================================
+# INFERENCE CONFIGURATION
+# =============================================================================
+inference:
+  confidence_threshold: 0.7         # Minimum confidence for detections
+  nms_threshold: 0.5                # NMS threshold (DETR usually doesn't need NMS)
+  use_nms: false                    # Whether to apply NMS (DETR handles this)
+  output_dir: "output"              # Output directory for visualizations
+  
+  # Visualization settings
+  draw_boxes: true                  # Draw bounding boxes
+  draw_labels: true                 # Draw class labels
+  box_color: [0, 255, 0]            # Box color (BGR)
+  text_color: [255, 255, 255]       # Text color (BGR)
+  font_scale: 0.6                   # Font scale for labels
