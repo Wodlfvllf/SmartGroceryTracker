@@ -1,284 +1,218 @@
 #!/usr/bin/env python
 """
-Training Script for DETR Fine-tuning
-====================================
+Training Script for DETR Fine-tuning (Modal Labs Cloud)
+========================================================
 
-Script B: Fine-tune a pretrained DETR model on custom grocery datasets
-(Fruits360, SKU110k, Custom Refrigerator Dataset).
+Script B: Fine-tune a pretrained DETR model on custom grocery datasets.
 
-This script:
-1. Loads pretrained DETR from Hugging Face
-2. Replaces classification head for custom grocery classes
-3. Fine-tunes on your COCO-format dataset
-4. Uses Hungarian matching loss (bipartite matching)
-5. Saves checkpoints and best model
+This script runs on Modal Labs cloud with GPU support.
 
-Usage:
-    # Basic training
-    python train.py --train_images data/train/images \
-                    --train_annotations data/train/annotations.json
+Usage (Modal Cloud):
+    # Basic training (uses SmartFridgeV2 defaults)
+    modal run train.py
     
-    # With validation
-    python train.py --train_images data/train/images \
-                    --train_annotations data/train/annotations.json \
-                    --val_images data/val/images \
-                    --val_annotations data/val/annotations.json
+    # With custom paths
+    modal run train.py --train-images /data/train \\
+                       --train-annotations /data/train/_annotations.coco.json
     
-    # Custom configuration
-    python train.py --config configs/default.yaml --epochs 100 --batch_size 4
-
-Dataset Preparation:
-    Ensure your data is in COCO format:
-    data/
-    ├── train/
-    │   ├── images/          # Training images
-    │   └── annotations.json # COCO format annotations
-    └── val/
-        ├── images/          # Validation images
-        └── annotations.json # COCO format annotations
+    # Custom epochs and batch size
+    modal run train.py --epochs 100 --batch-size 4
 """
 
-import argparse
-import os
-from pathlib import Path
+import modal
 
-import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import StepLR
+# =============================================================================
+# MODAL CONFIGURATION (self-contained)
+# =============================================================================
 
-from models.detr import build_detr
-from training.criterion import build_criterion
-from training.trainer import Trainer
-from data.dataset import build_dataloader
-from utils.misc import load_config, get_device
+APP_NAME = "smart-grocery-training"
+app = modal.App(APP_NAME)
 
+# Docker image with all dependencies
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1-mesa-glx", "libglib2.0-0", "git")
+    .pip_install(
+        "torch>=2.0.0",
+        "torchvision>=0.15.0",
+        "transformers>=4.30.0",
+        "opencv-python>=4.8.0",
+        "Pillow>=9.0.0",
+        "numpy>=1.24.0",
+        "scipy>=1.10.0",
+        "albumentations>=1.3.0",
+        "pycocotools>=2.0.6",
+        "pyyaml>=6.0",
+        "tqdm>=4.65.0",
+        "matplotlib>=3.7.0",
+        "scikit-learn>=1.2.0",
+    )
+)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train DETR on grocery dataset")
-    
-    # Data arguments
-    parser.add_argument('--train_images', type=str, required=True,
-                        help='Path to training images directory')
-    parser.add_argument('--train_annotations', type=str, required=True,
-                        help='Path to training annotations JSON (COCO format)')
-    parser.add_argument('--val_images', type=str, default=None,
-                        help='Path to validation images directory')
-    parser.add_argument('--val_annotations', type=str, default=None,
-                        help='Path to validation annotations JSON')
-    
-    # Configuration
-    parser.add_argument('--config', type=str, default='configs/default.yaml',
-                        help='Path to configuration file')
-    
-    # Model arguments
-    parser.add_argument('--use_pretrained', action='store_true', default=True,
-                        help='Use pretrained DETR (default: True)')
-    parser.add_argument('--from_scratch', action='store_true',
-                        help='Train from scratch instead of pretrained')
-    parser.add_argument('--pretrained_model', type=str, 
-                        default='facebook/detr-resnet-50',
-                        help='Hugging Face model name for pretrained DETR')
-    parser.add_argument('--num_queries', type=int, default=100,
-                        help='Number of object queries')
-    parser.add_argument('--freeze_backbone', action='store_true',
-                        help='Freeze backbone weights')
-    
-    # Training arguments
-    parser.add_argument('--epochs', type=int, default=300,
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=2,
-                        help='Batch size (DETR uses small batches)')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--lr_backbone', type=float, default=1e-5,
-                        help='Learning rate for backbone')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
-                        help='Weight decay')
-    parser.add_argument('--clip_max_norm', type=float, default=0.1,
-                        help='Maximum gradient norm')
-    parser.add_argument('--lr_drop', type=int, default=200,
-                        help='Epoch to drop learning rate')
-    
-    # System arguments
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device (cuda, mps, cpu)')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Data loader workers')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
-                        help='Checkpoint directory')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume from')
-    parser.add_argument('--use_amp', action='store_true', default=True,
-                        help='Use automatic mixed precision')
-    parser.add_argument('--no_amp', action='store_true',
-                        help='Disable AMP')
-    
-    return parser.parse_args()
+# Volumes
+data_volume = modal.Volume.from_name("grocery-data", create_if_missing=True)
+checkpoints_volume = modal.Volume.from_name("grocery-checkpoints", create_if_missing=True)
 
+DATA_PATH = "/data"
+CHECKPOINTS_PATH = "/checkpoints"
+GPU_TRAINING = "A10G"
 
-def main():
-    args = parse_args()
+# =============================================================================
+# MODAL FUNCTION
+# =============================================================================
+
+@app.function(
+    gpu=GPU_TRAINING,
+    image=image,
+    volumes={
+        DATA_PATH: data_volume,
+        CHECKPOINTS_PATH: checkpoints_volume,
+    },
+    timeout=86400,  # 24 hours
+    mounts=[
+        modal.Mount.from_local_dir(
+            ".",
+            remote_path="/app",
+            condition=lambda path: not any(
+                x in path for x in [".git", "__pycache__", ".pyc", "checkpoints", "output", "SmartFridgeV2", ".zip"]
+            ),
+        )
+    ],
+)
+def train_detr(
+    train_images: str,
+    train_annotations: str,
+    val_images: str = None,
+    val_annotations: str = None,
+    config: str = "/app/configs/default.yaml",
+    use_pretrained: bool = True,
+    pretrained_model: str = "facebook/detr-resnet-50",
+    num_queries: int = 100,
+    freeze_backbone: bool = False,
+    epochs: int = 300,
+    batch_size: int = 2,
+    lr: float = 1e-4,
+    lr_backbone: float = 1e-5,
+    weight_decay: float = 1e-4,
+    clip_max_norm: float = 0.1,
+    lr_drop: int = 200,
+    num_workers: int = 4,
+    checkpoint_dir: str = CHECKPOINTS_PATH,
+    resume: str = None,
+    use_amp: bool = True,
+) -> dict:
+    """Train DETR model on Modal cloud with GPU."""
+    import os
+    import sys
     
-    # Override pretrained flag if from_scratch is set
-    if args.from_scratch:
-        args.use_pretrained = False
+    # Add project to path
+    sys.path.insert(0, "/app")
     
-    # Override AMP if no_amp is set
-    if args.no_amp:
-        args.use_amp = False
+    import torch
+    from torch.optim import AdamW
+    from torch.optim.lr_scheduler import StepLR
     
-    # Get device
-    device = get_device() if args.device is None else torch.device(args.device)
+    from models.detr import build_detr
+    from training.criterion import build_criterion
+    from training.trainer import Trainer
+    from data.dataset import build_dataloader
+    from utils.misc import load_config, get_device
+    
+    device = get_device()
     print(f"\n{'='*60}")
-    print("DETR Training for Smart Grocery Tracker")
+    print("DETR Training for Smart Grocery Tracker (Modal Cloud)")
     print(f"{'='*60}")
     print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"{'='*60}\n")
     
-    # =================================================================
-    # Step 1: Load Configuration
-    # =================================================================
-    config = {}
-    if os.path.exists(args.config):
-        config = load_config(args.config)
-        print(f"Loaded configuration from: {args.config}")
+    # Load config
+    cfg = {}
+    if os.path.exists(config):
+        cfg = load_config(config)
+        print(f"Loaded config: {config}")
     
-    # Get class names from config
-    class_names = config.get('classes', [
+    class_names = cfg.get('classes', [
         'banana', 'apple', 'orange', 'avocado', 'lemon', 'strawberry', 'grape',
         'tomato', 'lettuce', 'carrot', 'cucumber', 'broccoli', 'onion', 'pepper',
         'milk', 'juice', 'yogurt', 'cheese', 'butter',
         'egg_carton', 'bottle', 'can', 'container', 'jar',
     ])
     num_classes = len(class_names)
+    print(f"Classes: {num_classes}")
     
-    print(f"Number of classes: {num_classes}")
-    print(f"Classes: {class_names[:5]}... (see config for full list)")
-    
-    # =================================================================
-    # Step 2: Build Datasets
-    # =================================================================
+    # Build datasets
     print("\nBuilding datasets...")
-    
     train_loader, train_dataset = build_dataloader(
-        img_folder=args.train_images,
-        ann_file=args.train_annotations,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        img_folder=train_images,
+        ann_file=train_annotations,
+        batch_size=batch_size,
+        num_workers=num_workers,
         is_train=True,
     )
-    print(f"Training: {len(train_dataset)} images, {len(train_loader)} batches")
+    print(f"Training: {len(train_dataset)} images")
     
     val_loader = None
-    if args.val_images and args.val_annotations:
+    if val_images and val_annotations:
         val_loader, val_dataset = build_dataloader(
-            img_folder=args.val_images,
-            ann_file=args.val_annotations,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
+            img_folder=val_images,
+            ann_file=val_annotations,
+            batch_size=batch_size,
+            num_workers=num_workers,
             is_train=False,
         )
-        print(f"Validation: {len(val_dataset)} images, {len(val_loader)} batches")
+        print(f"Validation: {len(val_dataset)} images")
     
-    # Update num_classes from dataset if different
     if hasattr(train_dataset, 'num_classes') and train_dataset.num_classes > 0:
         num_classes = train_dataset.num_classes
-        print(f"Updated num_classes from dataset: {num_classes}")
     
-    # =================================================================
-    # Step 3: Build Model
-    # =================================================================
+    # Build model
     print("\nBuilding model...")
-    
     model = build_detr(
         num_classes=num_classes,
-        use_pretrained=args.use_pretrained,
-        pretrained_model=args.pretrained_model,
-        num_queries=args.num_queries,
-        freeze_backbone=args.freeze_backbone,
+        use_pretrained=use_pretrained,
+        pretrained_model=pretrained_model,
+        num_queries=num_queries,
+        freeze_backbone=freeze_backbone,
     )
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Parameters: {total_params:,} total, {trainable_params:,} trainable")
     
-    # =================================================================
-    # Step 4: Build Criterion
-    # =================================================================
-    print("\nBuilding loss criterion...")
-    
-    # Loss weights from config
-    loss_config = config.get('loss', {})
+    # Build criterion
+    loss_cfg = cfg.get('loss', {})
     criterion = build_criterion(
         num_classes=num_classes,
-        cost_class=loss_config.get('cost_class', 1.0),
-        cost_bbox=loss_config.get('cost_bbox', 5.0),
-        cost_giou=loss_config.get('cost_giou', 2.0),
-        loss_ce=loss_config.get('loss_ce', 1.0),
-        loss_bbox=loss_config.get('loss_bbox', 5.0),
-        loss_giou=loss_config.get('loss_giou', 2.0),
-        eos_coef=loss_config.get('eos_coef', 0.1),
+        cost_class=loss_cfg.get('cost_class', 1.0),
+        cost_bbox=loss_cfg.get('cost_bbox', 5.0),
+        cost_giou=loss_cfg.get('cost_giou', 2.0),
+        loss_ce=loss_cfg.get('loss_ce', 1.0),
+        loss_bbox=loss_cfg.get('loss_bbox', 5.0),
+        loss_giou=loss_cfg.get('loss_giou', 2.0),
+        eos_coef=loss_cfg.get('eos_coef', 0.1),
     )
     
-    print("Loss components:")
-    print(f"  - Classification (CE): weight={loss_config.get('loss_ce', 1.0)}")
-    print(f"  - Bounding box (L1): weight={loss_config.get('loss_bbox', 5.0)}")
-    print(f"  - GIoU: weight={loss_config.get('loss_giou', 2.0)}")
-    print(f"  - No-object weight: {loss_config.get('eos_coef', 0.1)}")
-    
-    # =================================================================
-    # Step 5: Build Optimizer
-    # =================================================================
-    print("\nBuilding optimizer...")
-    
-    # Separate backbone and other parameters for different learning rates
+    # Build optimizer
     param_dicts = [
-        {
-            "params": [p for n, p in model.named_parameters()
-                      if "backbone" not in n and p.requires_grad],
-            "lr": args.lr,
-        },
-        {
-            "params": [p for n, p in model.named_parameters()
-                      if "backbone" in n and p.requires_grad],
-            "lr": args.lr_backbone,
-        },
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad], "lr": lr},
+        {"params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad], "lr": lr_backbone},
     ]
+    optimizer = AdamW(param_dicts, lr=lr, weight_decay=weight_decay)
+    scheduler = StepLR(optimizer, step_size=lr_drop, gamma=0.1)
     
-    optimizer = AdamW(
-        param_dicts,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    print(f"Optimizer: AdamW, LR={lr}, LR_backbone={lr_backbone}")
     
-    print(f"Optimizer: AdamW")
-    print(f"  - LR (transformer): {args.lr}")
-    print(f"  - LR (backbone): {args.lr_backbone}")
-    print(f"  - Weight decay: {args.weight_decay}")
-    
-    # Learning rate scheduler
-    scheduler = StepLR(optimizer, step_size=args.lr_drop, gamma=0.1)
-    print(f"Scheduler: StepLR, drop at epoch {args.lr_drop}")
-    
-    # =================================================================
-    # Step 6: Resume from checkpoint if provided
-    # =================================================================
-    if args.resume:
-        print(f"\nResuming from: {args.resume}")
+    # Resume if provided
+    if resume:
         from utils.misc import load_checkpoint
-        ckpt = load_checkpoint(
-            args.resume, model, optimizer, scheduler, device
-        )
-        start_epoch = ckpt.get('epoch', 0) + 1
-        print(f"Resuming from epoch {start_epoch}")
+        load_checkpoint(resume, model, optimizer, scheduler, device)
     
-    # =================================================================
-    # Step 7: Build Trainer and Train
-    # =================================================================
-    print("\nInitializing trainer...")
+    # Train
+    print("\n" + "="*60)
+    print("Starting Training")
+    print("="*60)
     
     trainer = Trainer(
         model=model,
@@ -288,27 +222,67 @@ def main():
         val_loader=val_loader,
         scheduler=scheduler,
         device=device,
-        checkpoint_dir=args.checkpoint_dir,
-        use_amp=args.use_amp,
-        clip_max_norm=args.clip_max_norm,
+        checkpoint_dir=checkpoint_dir,
+        use_amp=use_amp,
+        clip_max_norm=clip_max_norm,
     )
     
-    print("\n" + "="*60)
-    print("Starting Training")
-    print("="*60)
-    
-    history = trainer.train(
-        num_epochs=args.epochs,
-        save_every=10,
-        validate_every=1,
-    )
+    history = trainer.train(num_epochs=epochs, save_every=10, validate_every=1)
     
     print("\n" + "="*60)
     print("Training Complete!")
+    print(f"Models saved to: {checkpoint_dir}")
     print("="*60)
-    print(f"Best model saved to: {args.checkpoint_dir}/best_model.pth")
-    print(f"Final model saved to: {args.checkpoint_dir}/final_model.pth")
+    
+    # Commit checkpoints
+    checkpoints_volume.commit()
+    
+    return {
+        "epochs": epochs,
+        "final_train_loss": history['train_loss'][-1] if history['train_loss'] else None,
+        "checkpoint_dir": checkpoint_dir,
+    }
 
 
-if __name__ == '__main__':
-    main()
+@app.local_entrypoint()
+def main(
+    train_images: str = None,
+    train_annotations: str = None,
+    val_images: str = None,
+    val_annotations: str = None,
+    epochs: int = 300,
+    batch_size: int = 2,
+    lr: float = 1e-4,
+    freeze_backbone: bool = False,
+):
+    """Run training via: modal run train.py"""
+    # Defaults
+    if train_images is None:
+        train_images = f"{DATA_PATH}/SmartFridgeV2_Final.v8i.coco/train"
+    if train_annotations is None:
+        train_annotations = f"{DATA_PATH}/SmartFridgeV2_Final.v8i.coco/train/_annotations.coco.json"
+    if val_images is None:
+        val_images = f"{DATA_PATH}/SmartFridgeV2_Final.v8i.coco/valid"
+    if val_annotations is None:
+        val_annotations = f"{DATA_PATH}/SmartFridgeV2_Final.v8i.coco/valid/_annotations.coco.json"
+    
+    print("Starting DETR training on Modal cloud...")
+    print(f"  Train: {train_images}")
+    print(f"  Epochs: {epochs}, Batch size: {batch_size}")
+    print(f"  GPU: {GPU_TRAINING}")
+    
+    result = train_detr.remote(
+        train_images=train_images,
+        train_annotations=train_annotations,
+        val_images=val_images,
+        val_annotations=val_annotations,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        freeze_backbone=freeze_backbone,
+    )
+    
+    print(f"\nTraining completed!")
+    print(f"  Final loss: {result['final_train_loss']}")
+    print(f"  Checkpoints: {result['checkpoint_dir']}")
+    return result
