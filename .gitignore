@@ -23,6 +23,7 @@ checkpoints/
 *.onnx
 output/
 results/
+local_results/
 
 # -----------------------------------------------------------------------------
 # Python
